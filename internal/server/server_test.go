@@ -97,6 +97,24 @@ func TestAcquireUploadAndDownload(t *testing.T) {
 	if downloadResponse.StatusCode != http.StatusPartialContent || string(downloaded) != "2345" {
 		t.Fatalf("range status=%d body=%q", downloadResponse.StatusCode, downloaded)
 	}
+
+	headResponse, err := http.Head(httpServer.URL + "/" + wantKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	headResponse.Body.Close()
+	if headResponse.StatusCode != http.StatusOK || headResponse.ContentLength != int64(len(content)) {
+		t.Fatalf("head status=%d length=%d", headResponse.StatusCode, headResponse.ContentLength)
+	}
+	optionsRequest, _ := http.NewRequest(http.MethodOptions, httpServer.URL+"/anything", nil)
+	optionsResponse, err := http.DefaultClient.Do(optionsRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	optionsResponse.Body.Close()
+	if optionsResponse.StatusCode != http.StatusNoContent {
+		t.Fatalf("options status = %d", optionsResponse.StatusCode)
+	}
 }
 
 func TestAcquirePreservesRequestedObjectName(t *testing.T) {

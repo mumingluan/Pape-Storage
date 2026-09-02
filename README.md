@@ -2,6 +2,8 @@
 
 面向 Pape 客户端的简易本地对象存储。服务只负责临时上传凭证、multipart 对象上传和公开对象分发，不包含账号或游戏业务。
 
+HTTP API 使用 Gin，配置文件采用 YAML。
+
 ## 协议
 
 - `POST /admin/v1/upload-tokens`：Pape-SDK 使用 `Authorization: Bearer <admin_token>` 获取限定对象键、有效期和体积的短期上传表单。

@@ -23,6 +23,9 @@ import (
 
 	"pape-storage/internal/config"
 	"pape-storage/internal/token"
+
+	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
 )
 
 type Server struct {
@@ -70,55 +73,52 @@ func Run(cfg *config.Config) error {
 }
 
 func (s *Server) Handler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		s.setCORS(w)
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
+	gin.SetMode(gin.ReleaseMode)
+	binding.EnableDecoderDisallowUnknownFields = true
+	router := gin.New()
+	router.Use(gin.Recovery(), s.cors())
+	router.GET("/healthz", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	})
+	router.POST("/admin/v1/upload-tokens", s.acquire)
+	router.POST("/", s.upload)
+	router.NoRoute(func(c *gin.Context) {
+		if c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead {
+			s.download(c)
 			return
 		}
-		switch {
-		case r.URL.Path == "/healthz" && r.Method == http.MethodGet:
-			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-		case r.URL.Path == "/admin/v1/upload-tokens" && r.Method == http.MethodPost:
-			s.acquire(w, r)
-		case r.URL.Path == "/" && r.Method == http.MethodPost:
-			s.upload(w, r)
-		case r.Method == http.MethodGet || r.Method == http.MethodHead:
-			s.download(w, r)
-		default:
-			http.Error(w, "not found", http.StatusNotFound)
-		}
+		c.String(http.StatusNotFound, "not found")
 	})
+	return router
 }
 
-func (s *Server) acquire(w http.ResponseWriter, r *http.Request) {
-	provided := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+func (s *Server) acquire(c *gin.Context) {
+	provided := strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer "))
 	if !hmac.Equal([]byte(provided), []byte(s.cfg.AdminToken)) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		c.String(http.StatusUnauthorized, "unauthorized")
 		return
 	}
 	var request acquireRequest
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&request); err != nil {
-		http.Error(w, "invalid JSON request", http.StatusBadRequest)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10)
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.String(http.StatusBadRequest, "invalid JSON request")
 		return
 	}
 	category, err := cleanObjectKey(request.Category)
 	if err != nil || category == "" {
-		http.Error(w, "invalid category", http.StatusBadRequest)
+		c.String(http.StatusBadRequest, "invalid category")
 		return
 	}
 	id, err := s.randomKey()
 	if err != nil {
-		http.Error(w, "could not generate object key", http.StatusInternalServerError)
+		c.String(http.StatusInternalServerError, "could not generate object key")
 		return
 	}
 	objectName := request.ObjectName
 	if objectName != "" {
 		objectName, err = cleanObjectName(objectName)
 		if err != nil {
-			http.Error(w, "invalid object_name", http.StatusBadRequest)
+			c.String(http.StatusBadRequest, "invalid object_name")
 			return
 		}
 	} else {
@@ -132,7 +132,7 @@ func (s *Server) acquire(w http.ResponseWriter, r *http.Request) {
 	expires := s.now().Add(time.Duration(s.cfg.TokenTTLSeconds) * time.Second)
 	uploadToken, err := s.signer.Sign(token.Claims{Key: objectKey, Expires: expires.Unix(), MaxBytes: maxBytes})
 	if err != nil {
-		http.Error(w, "could not sign upload token", http.StatusInternalServerError)
+		c.String(http.StatusInternalServerError, "could not sign upload token")
 		return
 	}
 	policyJSON, _ := json.Marshal(map[string]any{
@@ -154,51 +154,57 @@ func (s *Server) acquire(w http.ResponseWriter, r *http.Request) {
 		},
 		AddHeader: map[string]string{"Date": now.Format(http.TimeFormat)},
 	}
-	writeJSON(w, http.StatusOK, response)
+	c.JSON(http.StatusOK, response)
 }
 
-func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxUploadBytes+(2<<20))
+func (s *Server) upload(c *gin.Context) {
+	r := c.Request
+	r.Body = http.MaxBytesReader(c.Writer, r.Body, s.cfg.MaxUploadBytes+(2<<20))
 	if err := r.ParseMultipartForm(1 << 20); err != nil {
-		http.Error(w, "invalid multipart upload", http.StatusBadRequest)
+		c.String(http.StatusBadRequest, "invalid multipart upload")
 		return
 	}
 	if r.MultipartForm != nil {
 		defer r.MultipartForm.RemoveAll()
 	}
-	value := r.FormValue("x-oss-security-token")
+	value := c.PostForm("x-oss-security-token")
 	claims, err := s.signer.Verify(value)
 	if err != nil {
-		http.Error(w, "invalid or expired upload token", http.StatusForbidden)
+		c.String(http.StatusForbidden, "invalid or expired upload token")
 		return
 	}
-	key, err := cleanObjectKey(r.FormValue("key"))
+	key, err := cleanObjectKey(c.PostForm("key"))
 	if err != nil || key != claims.Key {
-		http.Error(w, "object key does not match upload token", http.StatusForbidden)
+		c.String(http.StatusForbidden, "object key does not match upload token")
 		return
 	}
-	if signature := r.FormValue("x-oss-signature"); signature != "" && !hmac.Equal([]byte(signature), []byte(s.formSignature(value))) {
-		http.Error(w, "invalid form signature", http.StatusForbidden)
+	if signature := c.PostForm("x-oss-signature"); signature != "" && !hmac.Equal([]byte(signature), []byte(s.formSignature(value))) {
+		c.String(http.StatusForbidden, "invalid form signature")
 		return
 	}
-	file, _, err := r.FormFile("file")
+	fileHeader, err := c.FormFile("file")
 	if err != nil {
-		http.Error(w, "file field is required", http.StatusBadRequest)
+		c.String(http.StatusBadRequest, "file field is required")
+		return
+	}
+	file, err := fileHeader.Open()
+	if err != nil {
+		c.String(http.StatusBadRequest, "file field is invalid")
 		return
 	}
 	defer file.Close()
 	destination, err := s.objectPath(key)
 	if err != nil {
-		http.Error(w, "invalid object key", http.StatusBadRequest)
+		c.String(http.StatusBadRequest, "invalid object key")
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
-		http.Error(w, "could not create object directory", http.StatusInternalServerError)
+		c.String(http.StatusInternalServerError, "could not create object directory")
 		return
 	}
 	temporary, err := os.CreateTemp(filepath.Dir(destination), ".upload-*")
 	if err != nil {
-		http.Error(w, "could not create object", http.StatusInternalServerError)
+		c.String(http.StatusInternalServerError, "could not create object")
 		return
 	}
 	temporaryName := temporary.Name()
@@ -212,58 +218,59 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 	digest := md5.New()
 	written, copyErr := io.Copy(io.MultiWriter(temporary, digest), io.LimitReader(file, claims.MaxBytes+1))
 	if copyErr != nil || written > claims.MaxBytes {
-		http.Error(w, "object exceeds upload limit", http.StatusRequestEntityTooLarge)
+		c.String(http.StatusRequestEntityTooLarge, "object exceeds upload limit")
 		return
 	}
 	if err := temporary.Close(); err != nil {
-		http.Error(w, "could not finish object", http.StatusInternalServerError)
+		c.String(http.StatusInternalServerError, "could not finish object")
 		return
 	}
 	if err := replaceFile(temporaryName, destination); err != nil {
-		http.Error(w, "could not commit object", http.StatusInternalServerError)
+		c.String(http.StatusInternalServerError, "could not commit object")
 		return
 	}
 	succeeded = true
 	checksum := digest.Sum(nil)
-	w.Header().Set("ETag", "\""+strings.ToUpper(hex.EncodeToString(checksum))+"\"")
-	w.Header().Set("Content-MD5", base64.StdEncoding.EncodeToString(checksum))
+	c.Header("ETag", "\""+strings.ToUpper(hex.EncodeToString(checksum))+"\"")
+	c.Header("Content-MD5", base64.StdEncoding.EncodeToString(checksum))
 	requestID, _ := randomObjectID()
-	w.Header().Set("x-oss-request-id", strings.ToUpper(requestID))
-	w.WriteHeader(successStatus(r.FormValue("success_action_status")))
+	c.Header("x-oss-request-id", strings.ToUpper(requestID))
+	c.Status(successStatus(c.PostForm("success_action_status")))
 }
 
-func (s *Server) download(w http.ResponseWriter, r *http.Request) {
-	key, err := cleanObjectKey(strings.TrimPrefix(r.URL.Path, "/"))
+func (s *Server) download(c *gin.Context) {
+	r := c.Request
+	key, err := cleanObjectKey(strings.TrimPrefix(c.Request.URL.Path, "/"))
 	if err != nil || key == "" {
-		http.NotFound(w, r)
+		c.Status(http.StatusNotFound)
 		return
 	}
 	objectPath, err := s.objectPath(key)
 	if err != nil {
-		http.NotFound(w, r)
+		c.Status(http.StatusNotFound)
 		return
 	}
 	file, err := os.Open(objectPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			http.NotFound(w, r)
+			c.Status(http.StatusNotFound)
 		} else {
-			http.Error(w, "could not open object", http.StatusInternalServerError)
+			c.String(http.StatusInternalServerError, "could not open object")
 		}
 		return
 	}
 	defer file.Close()
 	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() {
-		http.NotFound(w, r)
+		c.Status(http.StatusNotFound)
 		return
 	}
-	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-	w.Header().Set("ETag", fmt.Sprintf("W/\"%x-%x\"", info.Size(), info.ModTime().UnixNano()))
+	c.Header("Cache-Control", "public, max-age=31536000, immutable")
+	c.Header("ETag", fmt.Sprintf("W/\"%x-%x\"", info.Size(), info.ModTime().UnixNano()))
 	if contentType := mime.TypeByExtension(path.Ext(key)); contentType != "" {
-		w.Header().Set("Content-Type", contentType)
+		c.Header("Content-Type", contentType)
 	}
-	http.ServeContent(w, r, path.Base(key), info.ModTime(), file)
+	http.ServeContent(c.Writer, r, path.Base(key), info.ModTime(), file)
 }
 
 func (s *Server) objectPath(key string) (string, error) {
@@ -359,15 +366,16 @@ func successStatus(value string) int {
 	return http.StatusOK
 }
 
-func writeJSON(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
-}
-
-func (s *Server) setCORS(w http.ResponseWriter) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Range")
-	w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range, ETag")
+func (s *Server) cors() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("Access-Control-Allow-Origin", "*")
+		c.Header("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS")
+		c.Header("Access-Control-Allow-Headers", "Content-Type, Range")
+		c.Header("Access-Control-Expose-Headers", "Content-Length, Content-Range, ETag")
+		if c.Request.Method == http.MethodOptions {
+			c.AbortWithStatus(http.StatusNoContent)
+			return
+		}
+		c.Next()
+	}
 }
