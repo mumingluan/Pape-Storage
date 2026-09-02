@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"net/url"
@@ -69,6 +70,7 @@ func Run(cfg *config.Config) error {
 		return err
 	}
 	address := fmt.Sprintf("%s:%d", cfg.BindHost, cfg.BindPort)
+	log.Printf("[storage] listening on http://%s (public=%s, objects=%s)", address, cfg.PublicBaseURL, cfg.ObjectDir())
 	return http.ListenAndServe(address, srv.Handler())
 }
 
@@ -76,7 +78,7 @@ func (s *Server) Handler() http.Handler {
 	gin.SetMode(gin.ReleaseMode)
 	binding.EnableDecoderDisallowUnknownFields = true
 	router := gin.New()
-	router.Use(gin.Recovery(), s.cors())
+	router.Use(gin.Logger(), gin.Recovery(), s.cors())
 	router.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
