@@ -17,9 +17,10 @@ type Config struct {
 	BindPort        int    `yaml:"bind_port"`
 	DataDir         string `yaml:"data_dir"`
 	PublicBaseURL   string `yaml:"public_base_url"`
-	AdminToken      string `yaml:"admin_token"`
-	SigningKey      string `yaml:"signing_key"`
-	TokenTTLSeconds int    `yaml:"token_ttl_seconds"`
+	Bucket          string `yaml:"bucket"`
+	Region          string `yaml:"region"`
+	AccessKeyID     string `yaml:"access_key_id"`
+	AccessKeySecret string `yaml:"access_key_secret"`
 	MaxUploadBytes  int64  `yaml:"max_upload_bytes"`
 
 	BaseDir string `yaml:"-"`
@@ -50,20 +51,17 @@ func Load(path string) (*Config, error) {
 	if cfg.DataDir == "" {
 		cfg.DataDir = "./data/objects"
 	}
-	if cfg.TokenTTLSeconds == 0 {
-		cfg.TokenTTLSeconds = 20 * 60
-	}
 	if cfg.MaxUploadBytes == 0 {
 		cfg.MaxUploadBytes = 256 << 20
 	}
-	if strings.TrimSpace(cfg.AdminToken) == "" {
-		return nil, errors.New("admin_token is required")
+	if strings.TrimSpace(cfg.Bucket) == "" {
+		return nil, errors.New("bucket is required")
 	}
-	if len(cfg.SigningKey) < 32 {
-		return nil, errors.New("signing_key must contain at least 32 characters")
+	if strings.TrimSpace(cfg.Region) == "" {
+		return nil, errors.New("region is required")
 	}
-	if cfg.TokenTTLSeconds < 1 {
-		return nil, errors.New("token_ttl_seconds must be positive")
+	if strings.TrimSpace(cfg.AccessKeyID) == "" || strings.TrimSpace(cfg.AccessKeySecret) == "" {
+		return nil, errors.New("access_key_id and access_key_secret are required")
 	}
 	if cfg.MaxUploadBytes < 1 {
 		return nil, errors.New("max_upload_bytes must be positive")

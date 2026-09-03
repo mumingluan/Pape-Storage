@@ -10,7 +10,7 @@ func TestExampleConfigUsesCurrentSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.BindPort != 18083 || cfg.PublicBaseURL != "https://storage-deepspace.papegames.com" || cfg.TokenTTLSeconds != 1200 {
+	if cfg.BindPort != 65287 || cfg.PublicBaseURL != "https://storage-deepspace.papegames.com" || cfg.Bucket != "pape" || cfg.Region != "cn-hangzhou" {
 		t.Fatalf("example config = %+v", cfg)
 	}
 }

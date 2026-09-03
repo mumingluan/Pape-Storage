@@ -1,20 +1,16 @@
 package server
 
 import (
-	"crypto/hmac"
 	"crypto/md5"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"mime"
 	"net/http"
-	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -23,34 +19,15 @@ import (
 	"time"
 
 	"pape-storage/internal/config"
-	"pape-storage/internal/token"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gin-gonic/gin/binding"
 )
 
 type Server struct {
-	cfg       *config.Config
-	objects   string
-	signer    *token.Signer
-	now       func() time.Time
-	randomKey func() (string, error)
-}
-
-type acquireRequest struct {
-	ChannelID        string `json:"channel_id"`
-	Category         string `json:"category"`
-	OriginalFilename string `json:"original_filename"`
-	ObjectName       string `json:"object_name"`
-	Extension        string `json:"extension"`
-	MaxBytes         int64  `json:"max_bytes"`
-}
-
-type AcquireResponse struct {
-	Address   string            `json:"address"`
-	URL       string            `json:"url"`
-	AddForm   map[string]string `json:"add_form"`
-	AddHeader map[string]string `json:"add_header"`
+	cfg     *config.Config
+	objects string
+	now     func() time.Time
 }
 
 func New(cfg *config.Config) (*Server, error) {
@@ -59,8 +36,7 @@ func New(cfg *config.Config) (*Server, error) {
 		return nil, err
 	}
 	return &Server{
-		cfg: cfg, objects: objects, signer: token.New(cfg.SigningKey), now: time.Now,
-		randomKey: randomObjectID,
+		cfg: cfg, objects: objects, now: time.Now,
 	}, nil
 }
 
@@ -82,7 +58,6 @@ func (s *Server) Handler() http.Handler {
 	router.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
-	router.POST("/admin/v1/upload-tokens", s.acquire)
 	router.POST("/", s.upload)
 	router.NoRoute(func(c *gin.Context) {
 		if c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead {
@@ -92,71 +67,6 @@ func (s *Server) Handler() http.Handler {
 		c.String(http.StatusNotFound, "not found")
 	})
 	return router
-}
-
-func (s *Server) acquire(c *gin.Context) {
-	provided := strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer "))
-	if !hmac.Equal([]byte(provided), []byte(s.cfg.AdminToken)) {
-		c.String(http.StatusUnauthorized, "unauthorized")
-		return
-	}
-	var request acquireRequest
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10)
-	if err := c.ShouldBindJSON(&request); err != nil {
-		c.String(http.StatusBadRequest, "invalid JSON request")
-		return
-	}
-	category, err := cleanObjectKey(request.Category)
-	if err != nil || category == "" {
-		c.String(http.StatusBadRequest, "invalid category")
-		return
-	}
-	id, err := s.randomKey()
-	if err != nil {
-		c.String(http.StatusInternalServerError, "could not generate object key")
-		return
-	}
-	objectName := request.ObjectName
-	if objectName != "" {
-		objectName, err = cleanObjectName(objectName)
-		if err != nil {
-			c.String(http.StatusBadRequest, "invalid object_name")
-			return
-		}
-	} else {
-		objectName = id + safeExtension(request.Extension)
-	}
-	objectKey := category + "/" + objectName
-	maxBytes := request.MaxBytes
-	if maxBytes <= 0 || maxBytes > s.cfg.MaxUploadBytes {
-		maxBytes = s.cfg.MaxUploadBytes
-	}
-	expires := s.now().Add(time.Duration(s.cfg.TokenTTLSeconds) * time.Second)
-	uploadToken, err := s.signer.Sign(token.Claims{Key: objectKey, Expires: expires.Unix(), MaxBytes: maxBytes})
-	if err != nil {
-		c.String(http.StatusInternalServerError, "could not sign upload token")
-		return
-	}
-	policyJSON, _ := json.Marshal(map[string]any{
-		"expiration": expires.UTC().Format(time.RFC3339Nano),
-		"conditions": []any{map[string]string{"key": objectKey}, []any{"content-length-range", 0, maxBytes}},
-	})
-	now := s.now().UTC()
-	date := now.Format("20060102T150405Z")
-	credential := "PAPE/" + now.Format("20060102") + "/local/storage/pape_v1_request"
-	response := AcquireResponse{
-		Address: s.cfg.PublicBaseURL,
-		URL:     objectURL(s.cfg.PublicBaseURL, objectKey),
-		AddForm: map[string]string{
-			"key": objectKey, "policy": base64.StdEncoding.EncodeToString(policyJSON),
-			"success_action_status": "200", "x-oss-credential": credential,
-			"x-oss-date": date, "x-oss-security-token": uploadToken,
-			"x-oss-signature":         s.formSignature(uploadToken),
-			"x-oss-signature-version": "OSS4-HMAC-SHA256", "x:extend": "",
-		},
-		AddHeader: map[string]string{"Date": now.Format(http.TimeFormat)},
-	}
-	c.JSON(http.StatusOK, response)
 }
 
 func (s *Server) upload(c *gin.Context) {
@@ -169,19 +79,14 @@ func (s *Server) upload(c *gin.Context) {
 	if r.MultipartForm != nil {
 		defer r.MultipartForm.RemoveAll()
 	}
-	value := c.PostForm("x-oss-security-token")
-	claims, err := s.signer.Verify(value)
-	if err != nil {
-		c.String(http.StatusForbidden, "invalid or expired upload token")
-		return
-	}
 	key, err := cleanObjectKey(c.PostForm("key"))
-	if err != nil || key != claims.Key {
-		c.String(http.StatusForbidden, "object key does not match upload token")
+	if err != nil {
+		s.ossError(c, http.StatusBadRequest, "InvalidObjectName", "The specified object name is invalid.")
 		return
 	}
-	if signature := c.PostForm("x-oss-signature"); signature != "" && !hmac.Equal([]byte(signature), []byte(s.formSignature(value))) {
-		c.String(http.StatusForbidden, "invalid form signature")
+	limits, err := s.verifyPostPolicy(c, key)
+	if err != nil {
+		s.ossError(c, http.StatusForbidden, "SignatureDoesNotMatch", err.Error())
 		return
 	}
 	fileHeader, err := c.FormFile("file")
@@ -218,8 +123,8 @@ func (s *Server) upload(c *gin.Context) {
 		}
 	}()
 	digest := md5.New()
-	written, copyErr := io.Copy(io.MultiWriter(temporary, digest), io.LimitReader(file, claims.MaxBytes+1))
-	if copyErr != nil || written > claims.MaxBytes {
+	written, copyErr := io.Copy(io.MultiWriter(temporary, digest), io.LimitReader(file, limits.max+1))
+	if copyErr != nil || written > limits.max || written < limits.min {
 		c.String(http.StatusRequestEntityTooLarge, "object exceeds upload limit")
 		return
 	}
@@ -300,54 +205,12 @@ func cleanObjectKey(value string) (string, error) {
 	return clean, nil
 }
 
-func safeExtension(filename string) string {
-	filename = strings.TrimSpace(filename)
-	if filename != "" && !strings.Contains(filename, ".") {
-		filename = "." + filename
-	}
-	extension := strings.ToLower(path.Ext(strings.ReplaceAll(filename, "\\", "/")))
-	if len(extension) < 2 || len(extension) > 16 {
-		return ""
-	}
-	for _, character := range extension[1:] {
-		if character < 'a' || character > 'z' {
-			if character < '0' || character > '9' {
-				return ""
-			}
-		}
-	}
-	return extension
-}
-
-func cleanObjectName(value string) (string, error) {
-	value = strings.TrimSpace(value)
-	clean, err := cleanObjectKey(value)
-	if err != nil || strings.Contains(clean, "/") || clean != value {
-		return "", errors.New("invalid object name")
-	}
-	return clean, nil
-}
-
-func objectURL(baseURL, key string) string {
-	segments := strings.Split(key, "/")
-	for index := range segments {
-		segments[index] = url.PathEscape(segments[index])
-	}
-	return strings.TrimRight(baseURL, "/") + "/" + strings.Join(segments, "/")
-}
-
 func randomObjectID() (string, error) {
 	raw := make([]byte, 16)
 	if _, err := rand.Read(raw); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(raw), nil
-}
-
-func (s *Server) formSignature(uploadToken string) string {
-	mac := hmac.New(sha256.New, []byte(s.cfg.SigningKey))
-	_, _ = mac.Write([]byte(uploadToken))
-	return hex.EncodeToString(mac.Sum(nil))
 }
 
 func replaceFile(source, destination string) error {

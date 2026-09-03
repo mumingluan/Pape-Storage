@@ -1,39 +1,49 @@
 # Pape-Storage
 
-面向 Pape 客户端的简易本地对象存储。服务只负责临时上传凭证、multipart 对象上传和公开对象分发，不包含账号或游戏业务。
+面向 Pape 客户端的本地对象存储，上传接口实现阿里云 OSS `PostObject` V4 协议。Pape-SDK
+与真实阿里云 OSS、本服务使用完全相同的 policy 和签名，不再依赖 Storage 私有的令牌签发接口。
 
-HTTP API 使用 Gin，配置文件采用 YAML。
+## OSS 兼容接口
 
-## 协议
+- `POST /`：阿里云 OSS `PostObject`，接收 `multipart/form-data`；校验
+  `OSS4-HMAC-SHA256`、Credential Scope、policy、过期时间、对象键与体积限制。
+- `GET /<object-key>`：公开读取对象，支持 `Range` 与条件缓存。
+- `HEAD /<object-key>`：读取对象元数据。
+- `GET /healthz`：服务健康检查（扩展接口）。
 
-- `POST /admin/v1/upload-tokens`：Pape-SDK 使用 `Authorization: Bearer <admin_token>` 获取限定对象键、有效期和体积的短期上传表单。
-- `POST /`：客户端按返回的 `add_form` 发送 OSS 风格 multipart 表单，文件字段名为 `file`。
-- `GET|HEAD /<object-key>`：读取对象，支持标准 `Range`、条件缓存和 HEAD 请求。
-- `GET /healthz`：健康检查。
+上传成功响应包含 `ETag`、`Content-MD5` 和 `x-oss-request-id`；认证错误使用 OSS 风格 XML
+错误响应。原有 `POST /admin/v1/upload-tokens` 已移除。
 
-管理端请求示例：
+目前实现的是 Pape 客户端需要的 OSS API 子集，不包含 Bucket 管理、分片上传、版本控制等完整
+OSS 服务能力。对象默认公开读取，写入必须携带有效的 V4 Post Policy。
 
-```json
-{
-  "channel_id": "Photos",
-  "category": "photo/a222af2f",
-  "original_filename": "Upload17882734112.bin",
-  "object_name": "",
-  "extension": "",
-  "max_bytes": 104857600
-}
+## 配置
+
+```yaml
+bind_host: "0.0.0.0"
+bind_port: 65287
+data_dir: "./data/objects"
+public_base_url: "https://storage-deepspace.papegames.com"
+
+bucket: "pape"
+region: "cn-hangzhou"
+access_key_id: "replace-with-oss-compatible-access-key-id"
+access_key_secret: "replace-with-oss-compatible-access-key-secret"
+max_upload_bytes: 268435456
 ```
 
-返回结构与客户端使用的阿里云 OSS 表单一致，包含 `address`、`url`、`add_form` 和 `add_header`。`x-oss-security-token` 是由 Storage 自己签发的 HMAC 短期令牌；管理员 token 不会下发给客户端。
-
-当设备通过 Pape-SDK 的 MITM 代理联网时，建议把 `public_base_url` 设为 SDK `storage.public_host` 对应的 HTTPS 地址。SDK 会把该 Host 的上传和下载流量转发到 Storage，本地管理端路径不会公开。
+`bucket`、`region`、AccessKey 必须与 Pape-SDK 的 `storage` 配置一致。AccessKey Secret 只存在于
+SDK 服务端与 Storage 服务端，不会下发给游戏客户端；客户端拿到的是限定对象键、有效期和大小的
+签名 policy。
 
 ## 运行
 
-复制 `config.example.yaml` 为 `config.yaml`，替换两项独立密钥，然后执行：
+复制 `config.example.yaml` 为 `config.yaml`，设置凭证后执行：
 
 ```bash
 go run ./cmd/pape-storage -config config.yaml
 ```
 
-对象写入 `data_dir`。对象 URL 默认公开，这是为了兼容游戏客户端直接读取；写入始终要求有效临时令牌。
+当设备通过 Pape-SDK 的代理访问本服务时，将 SDK 的 `storage.endpoint` 指向公开域名，并将
+`storage.proxy_base_url` 指向本服务的内部 HTTP 地址。接入真实阿里云 OSS 时不设置
+`proxy_base_url`。

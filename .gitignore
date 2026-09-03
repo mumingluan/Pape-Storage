@@ -2,3 +2,5 @@
 /data/
 /pape-storage
 /pape-storage.exe
+*.exe~
+/AGENTS.md
